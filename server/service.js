@@ -1,40 +1,48 @@
 import fs from "fs";
-import config from "./config.js";
-import { randomUUID } from "crypto";
-import { extname, join } from "path";
-import { PassThrough } from "stream";
 import fsPromises from "fs/promises";
-import Throttle from "throttle";
-import { childProcess } from "child_process";
-import { logger } from "./util.js";
+import { randomUUID } from "crypto";
+import config from "./config.js";
+import { PassThrough, Writable } from "stream";
+import { once } from "events";
 import streamsPromises from "stream/promises";
-const {
-  dir: { publicDirectory },
-  constants: { fallbackBitRate, englishConversation, bitRateDivisor },
-} = config;
 
+import Throttle from "throttle";
+import childProcess from "child_process";
+import { logger } from "./util.js";
+import path, { join, extname } from "path";
+const {
+  dir: { publicDirectory, fxDirectory },
+  constants: {
+    fallbackBitRate,
+    englishConversation,
+    bitRateDivisor,
+    audioMediaType,
+    songVolume,
+    fxVolume,
+  },
+} = config;
 export class Service {
   constructor() {
-    this.clienStreams = new Map();
+    this.clientStreams = new Map();
     this.currentSong = englishConversation;
     this.currentBitRate = 0;
-    this.ThrottleTransform = {};
+    this.throttleTransform = {};
     this.currentReadable = {};
   }
-  //cliente recebe objeto
+
   createClientStream() {
     const id = randomUUID();
-    const clienStreams = new PassThrough();
-    this.clienStreams.set(id, clienStreams);
+    const clientStream = new PassThrough();
+    this.clientStreams.set(id, clientStream);
 
     return {
       id,
-      clienStreams,
+      clientStream,
     };
   }
 
-  removeClienteStream(id) {
-    this.clienStreams.delete(id);
+  removeClientStream(id) {
+    this.clientStreams.delete(id);
   }
 
   _executeSoxCommand(args) {
@@ -43,48 +51,73 @@ export class Service {
 
   async getBitRate(song) {
     try {
-      const args = ["--i", "-B", song];
+      const args = [
+        "--i", // info
+        "-B", // bitrate
+        song,
+      ];
       const {
-        stderr, //tudo o que é errl
-        stout, // tudo que é log
-        stdin, //enivar dados
+        stderr, // tudo que é erro
+        stdout, // tudo que é log
+        // stdin // enviar dados como stream
       } = this._executeSoxCommand(args);
 
-      const [sucess, error] = [stout, stderr].map((stream) => stream.read());
-      if (error) return await Promise.reject(error);
+      await Promise.all([once(stderr, "readable"), once(stdout, "readable")]);
 
-      return sucess.toString().trim().replace(/k/, "000");
+      const [success, error] = [stdout, stderr].map((stream) => stream.read());
+      if (error) return await Promise.reject(error);
+      return success.toString().trim().replace(/k/, "000");
     } catch (error) {
-      logger.error(`bitRate error ${error}`);
+      logger.error(`deu ruim no bitrate: ${error}`);
+
       return fallbackBitRate;
     }
   }
-  //trim remove espaço
 
-  async startStream() {
+  broadCast() {
+    return new Writable({
+      write: (chunk, enc, cb) => {
+        for (const [id, stream] of this.clientStreams) {
+          // se o cliente descontou não devemos mais mandar dados pra ele
+          if (stream.writableEnded) {
+            this.clientStreams.delete(id);
+            continue;
+          }
+
+          stream.write(chunk);
+        }
+
+        cb();
+      },
+    });
+  }
+  async startStreamming() {
     logger.info(`starting with ${this.currentSong}`);
-    const bitRate =
-      (this.currentBitRate = await this.getBitRate(this.currentSong)) /
-      bitRateDivisor;
-    //Controla fluxo de aplicações
-    const throttleTransform = new Throttle(bitRate);
-
+    const bitRate = (this.currentBitRate =
+      (await this.getBitRate(this.currentSong)) / bitRateDivisor);
+    const throttleTransform = (this.throttleTransform = new Throttle(bitRate));
     const songReadable = (this.currentReadable = this.createFileStream(
       this.currentSong
     ));
-    //ler ate o final
-    streamsPromises.pipeline(songReadable, throttleTransform);
+    return streamsPromises.pipeline(
+      songReadable,
+      throttleTransform,
+      this.broadCast()
+    );
   }
-  //percorre em blocos os arquivos
+
+  stopStreamming() {
+    this.throttleTransform?.end?.();
+  }
 
   createFileStream(filename) {
     return fs.createReadStream(filename);
   }
 
   async getFileInfo(file) {
-    //home/index.html
+    // file = home/index.html
     const fullFilePath = join(publicDirectory, file);
-    //valida se existe o arquivo
+    // valida se existe, se não existe estoura erro!!
     await fsPromises.access(fullFilePath);
     const fileType = extname(fullFilePath);
     return {
@@ -95,6 +128,75 @@ export class Service {
 
   async getFileStream(file) {
     const { name, type } = await this.getFileInfo(file);
-    return { stream: this.createFileStream(name), type };
+    return {
+      stream: this.createFileStream(name),
+      type,
+    };
+  }
+
+  //PEGA PEDAÇO DA STRING PARA RETORNAR O AUDIO
+  async readFxByName(fxName) {
+    const songs = await fsPromises.readdir(fxDirectory);
+    const chosenSong = songs.find((filename) =>
+      filename.toLowerCase().includes(fxName)
+    );
+    if (!chosenSong) return Promise.reject(`the song ${fxName} wasn't found!`);
+
+    return path.join(fxDirectory, chosenSong);
+  }
+
+  appendFxStream(fx) {
+    const throttleTransformable = new Throttle(this.currentBitRate);
+
+    //Pausa de forma curta a stream para os clientes
+    streamsPromises.pipeline(throttleTransformable, this.broadCast());
+
+    const unpipe = () => {
+      const transformStream = this.mergeAudioStreams(fx, this.currentReadable);
+
+      this.throttleTransform = throttleTransformable;
+      this.currentReadable = transformStream;
+
+      //evita vazamento de memoria
+      this.currentReadable.removeListener("unpipe", unpipe);
+
+      streamsPromises.pipeline(transformStream, throttleTransformable);
+    };
+    this.throttleTransform.on("unpipe", unpipe);
+    this.throttleTransform.pause();
+    this.currentReadable.unpipe(this.throttleTransform);
+  }
+
+  mergeAudioStreams(song, readable) {
+    const transformStream = PassThrough();
+    const args = [
+      "-t",
+      audioMediaType,
+      "-v",
+      songVolume,
+      // -m => merge -> o - é para receber como stream
+      "-m",
+      "-",
+      "-t",
+      audioMediaType,
+      "-v",
+      fxVolume,
+      song,
+      "-t",
+      audioMediaType,
+      "-",
+    ];
+
+    const { stdout, stdin } = this._executeSoxCommand(args);
+
+    // pluga stream de conversacao
+    // na entrada de dados do terminal
+    streamsPromises.pipeline(readable, stdin);
+    // .catch(error => logger.error(`error on sending stream to sox: ${error}`))
+
+    streamsPromises.pipeline(stdout, transformStream);
+    // .catch(error => logger.error(`error on receiving stream from sox: ${error}`))
+
+    return transformStream;
   }
 }

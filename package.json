@@ -7,10 +7,16 @@
   "scripts": {
     "live-reload": "nodemon server/index.js",
     "start": "node server/index.js",
-    "test": "set NODE_OPTIONS=--experimental-vm-modules &&npx jest --runInBand --no-cache",
-    "test:watch": "set NODE_OPTIONS=--experimental-vm-modules &&npx jest --runInBand --no-cache --watchAll",
-    "test:coverage": "set NODE_OPTIONS=--experimental-vm-modules &&npx jest --runInBand --no-cache --coverage tests/unit",
-    "live-reload:docker": "docker-compose up live-reload"
+    "test": "set NODE_OPTIONS=--experimental-modules &&npx jest --runInBand --no-cache",
+    "test:watch": "set NODE_OPTIONS=--experimental-modules &&npx jest --runInBand --no-cache --watchAll",
+    "test:coverage": "set NODE_OPTIONS=--experimental-modules &&npx jest --runInBand --no-cache --coverage tests/unit",
+    "test:e2e": "set NODE_OPTIONS=--experimental-modules &&npx jest --runInBand --no-cache tests/e2e",
+    "live-reload:docker": "docker-compose up --build live-reload",
+
+   
+    "test:docker": "docker-compose up --build test",
+    "test:watch:docker": "docker-compose up --build test-watch",
+    "test:coverage:docker": "docker-compose up --build test-coverage"
   },
   "engines": {
     "node": "17"
@@ -18,7 +24,9 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "nodemon": "^2.0.15"
+    "nodemon": "^2.0.15",
+    "portfinder": "^1.0.28",
+    "supertest": "^6.2.2"
   },
   "dependencies": {
     "jest": "^27.5.1",
